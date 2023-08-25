@@ -1,0 +1,183 @@
+import torch
+import torch.nn as nn
+
+import numpy as np
+import random
+from collections import defaultdict
+
+class Ffunction(nn.Module):
+  def __init__(self, input_size):
+    super(Ffunction, self).__init__()
+    self.input_size = input_size
+    self.lstm = nn.LSTM(input_size, 64)
+    self.fullycon1 = nn.Linear(64, 64)
+    nn.init.orthogonal_(self.fullycon1.weight)
+    self.fullycon2 = nn.Linear(64, 64)
+    nn.init.orthogonal_(self.fullycon2.weight)
+    self.policy = nn.Linear(64, 5)
+    nn.init.orthogonal_(self.policy.weight)
+    self.value = nn.Linear(64, 1)
+    nn.init.orthogonal_(self.value.weight)
+
+    self.beta = 0.01
+
+  def forward(self, x): #x = input
+    result, _ = self.lstm(x.view(-1, 1, self.input_size))
+    result = nn.functional.elu(self.fullycon1(result.view(-1, 64)))
+    result = nn.functional.elu(self.fullycon2(result))
+    return nn.functional.softmax(self.policy(result)), self.value(result)
+
+  def get_a2c_loss(self, states, actions, rewards):
+    probs, values = self.forward(states)
+
+    #print("rewards/values")
+    #print(rewards)
+    #print()
+    #print(values)
+
+    #print(torch.argmax(probs, dim=1))
+    #print(actions)
+
+    advantage = rewards - values.view(batch_size)
+    actions_one_hot = torch.zeros(batch_size, 5)
+    actions_one_hot[torch.arange(batch_size), actions.view(batch_size)] = 1
+    logs = torch.log(torch.sum(probs.view(batch_size, 5) * actions_one_hot.view(batch_size, 5), (1)))
+    #print(values)
+    logloss = -logs * (advantage.view(batch_size)).detach()
+    entropyloss = -torch.sum(probs * torch.log(probs), (1))
+    #print("\nlogs", logs)
+
+    return logloss + self.beta * entropyloss + 0.5 * advantage * advantage
+
+
+agent1 = Ffunction(326)
+opt1 = torch.optim.Adam(agent1.parameters(), betas=(0.9, 0.999), eps=1 * 10 ** -8)
+batch_size = 1000
+
+agent2 = Ffunction(326)
+opt2 = torch.optim.Adam(agent2.parameters(), betas=(0.9, 0.999), eps=1 * 10 ** -8)
+
+# buffer_ag_N = [[input, action, revard]*number_of_samples]
+buffer_ag_1 = []
+buffer_ag_2 = []
+reward_buf = []
+
+def sample_from_buffer(buffer, batch_size=10):
+    batch = random.sample(buffer, batch_size)
+    inputs = [i[0] for i in batch]
+    actions = [i[1] for i in batch]
+    revards = [i[2] for i in batch]
+    
+    inputs = torch.FloatTensor(inputs)
+    actions = torch.LongTensor(actions)
+    revards = torch.FloatTensor(revards)
+    
+    return inputs, actions, revards
+
+def sample_buffer(buffer):
+  inputs = [i[0] for i in buffer]
+  actions = [i[1] for i in buffer]
+  revards = [i[2] for i in buffer]
+    
+  inputs = torch.FloatTensor(inputs)
+  actions = torch.LongTensor(actions)
+  revards = torch.FloatTensor(revards)
+  
+  return inputs, actions, revards
+
+for episodes in range(100000):
+
+  
+  environment = env(8, 20)
+
+  x_other1 = torch.FloatTensor([1] * 3) / 3
+  x_other1.requires_grad_(True)
+  opt_other1 = torch.optim.SGD([x_other1], lr=0.1)
+  x_self1 = [0] * 3
+  x_self1[environment.agents_goals[0]] = 1
+  x_self1 = torch.FloatTensor(x_self1)
+  x_self1.requires_grad_(False)
+
+  x_other2 = torch.FloatTensor([1] * 3) / 3
+  x_other2.requires_grad_(True)
+  opt_other2 = torch.optim.SGD([x_other2], lr=0.1)
+  x_self2 = [0] * 3
+  x_self2[environment.agents_goals[1]] = 1
+  x_self2 = torch.FloatTensor(x_self2)
+  x_self2.requires_grad_(False)
+
+
+  action1, action2 = 0, 0
+
+  seq1 = []
+  seq2 = []
+
+  for step in range(10):
+    #Make action
+    state1 = environment.observation(0)
+    input1 = torch.cat([torch.Tensor(state1), x_self1, x_other1])
+    probs1, values1 = agent1.forward(input1)
+    action1 = torch.argmax(probs1)
+    seq1.append([input1.tolist(), action1.tolist()])
+
+    
+    state2 = environment.observation(1)
+    input2 = torch.cat([torch.Tensor(state2), x_self2, x_other2])
+    probs2, values2 = agent2.forward(input2)
+    action2 = torch.argmax(probs2)
+    seq2.append([input2.tolist(), action2.tolist()])
+
+    #Update SOM
+    opt_other1.zero_grad()
+    input_other1 = torch.cat([torch.Tensor(state2), x_other1, x_self1])
+    probs1, _ = agent1.forward(input_other1)
+    loss = torch.nn.functional.cross_entropy(probs1.view(1, 5), torch.LongTensor([action2.item()]))
+    loss.backward()
+    opt_other1.step()
+
+    probs1, values1 = agent1.forward(input1)
+    #print(action1.item() == torch.argmax(probs1).item())
+
+    opt_other2.zero_grad()
+    input_other2 = torch.cat([torch.Tensor(state1), x_other2, x_self2])
+    probs2, _ = agent2.forward(input_other2)
+    loss = torch.nn.functional.cross_entropy(probs2.view(1, 5), torch.LongTensor([action1.item()]))
+    loss.backward()
+    opt_other2.step()
+
+
+    #Add SA to sequences
+    environment.step(0, action1.item())
+    
+    environment.step(1, action2.item())
+  
+  #Add sequences to buffer
+  reward = environment.reward()
+  reward_buf.append(reward)
+  for i in range(10):
+    buffer_ag_1.append(seq1[-i - 1] + [reward])
+    buffer_ag_2.append(seq2[-i - 1] + [reward])
+    reward *= 0.99
+
+  #A2C update
+  if(len(buffer_ag_1) >= batch_size and len(buffer_ag_2) >= batch_size):
+    inputs, actions, rewards = sample_buffer(buffer_ag_1)
+    opt1.zero_grad()
+    loss = torch.sum(agent1.get_a2c_loss(inputs, actions, rewards)) / batch_size
+    print(loss, ' ', end='')
+    loss.backward()
+    opt1.step()
+
+    inputs, actions, rewards = sample_buffer(buffer_ag_2)
+    opt2.zero_grad()
+    loss = torch.sum(agent2.get_a2c_loss(inputs, actions, rewards)) / batch_size
+    print(loss, end='\n')
+    loss.backward()
+    opt2.step()
+    
+    print(np.mean(reward_buf))
+
+    buffer_ag_1 = []
+    buffer_ag_2 = []
+    reward_buf = []
+
